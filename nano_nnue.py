@@ -1,10 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-# https://www.kaggle.com/competitions/fide-google-efficiency-chess-ai-challenge/discussion/551257
-# https://github.com/official-stockfish/nnue-pytorch/blob/master/docs/nnue.md#halfkp
-# https://timvieira.github.io/blog/post/2014/07/31/gumbel-max-trick/
+import torch.optim as optim
 
 NUM_PIECES = 11 # 1 our pawn, 2 our knight, 3 our bishop, 4 our rook, 5 our queen, 6-10 other pieces, 11 other king
 NUM_SQUARES = 64
@@ -36,7 +33,7 @@ class Embedding(nn.Module):
         batch_size, _ = active_features.shape
 
         indices_logits = self.indices_logits.reshape(1, NUM_FEATURES, NUM_VECTORS).expand(batch_size, -1, -1)
-        indices_sample = F.gumbel_softmax(indices_logits, tau=1.0, hard=False)
+        indices_sample = F.gumbel_softmax(indices_logits, tau=1.0, hard=True)
 
         num_piece_features = NUM_FEATURES // NUM_PIECES
         position_embedding = torch.zeros(batch_size, self.vector_dim, device=active_features.device)
@@ -77,42 +74,60 @@ class Embedding(nn.Module):
     def regularization_index_penalty(self):
         return torch.mean(self.indices_logits ** 2)
 
-    def regularization_loss_term(self, l1, l2, l3):
+    def regularization_loss(self, l1, l2, l3):
         return l1 * self.regularization_king_square() + l2 * self.regularization_neighboring_squares() + l3 * self.regularization_index_penalty()
 
 class NanoNNUE(nn.Module):
     def __init__(self):
         super(NanoNNUE, self).__init__()
-        self.black_halfkp = Embedding()
-        self.white_halfkp = Embedding()
+        self.half_kp = Embedding()
         self.seq = nn.Sequential(
             nn.Linear(512, 16),
+            nn.LeakyReLU(),
             nn.Linear(16, 32),
-            nn.Linear(32, 8) 
+            nn.LeakyReLU(),
+            nn.Linear(32, 1) # TODO: maybe have 8, one for each game stage
         )
 
     @staticmethod
     def encode_fen_to_features(position):
-        # TODO: return stage as well
+        '''
+        position: fen string
+        returns: tuple of black embedding and white embedding
+        '''
+        # TODO
         pass
 
-    def forward(self, features, stage):
-        # convert position to features
-        black_embedding = self.black_halfkp.forward(features[0])
-        white_embedding = self.white_halfkp.forward(features[1])
+    def forward(self, features):
+        black_embedding = self.half_kp.forward(features[0])
+        white_embedding = self.half_kp.forward(features[1])
         total_embedding = torch.cat((black_embedding, white_embedding), dim=1)
-        assert total_embedding.shape[1] == 512
         return self.seq.forward(total_embedding)
 
-    def loss():
-        pass
-
-emb = NanoNNUE()
-b = torch.randn(1, NUM_FEATURES)
-w = torch.randn(1, NUM_FEATURES)
-print(emb.forward((b, w), None).shape)
+    def loss(self, x, y_exp, loss_fn=nn.MSELoss):
+        y = self.forward(x)
+        regression_loss = loss_fn(y, y_exp)
+        return regression_loss + self.half_kp.regularization_loss()
 
 if __name__ == "__main__":
     from pyarrow import parquet as pq
+    import pyarrow as pa
 
-    dataset = pq.ParquetFile("train-00000-of-00124.parquet").iter_batches(batch_size=8)
+    model = NanoNNUE()
+    optimizer = optim.Adam(model.parameters())
+
+    for batch in pq.ParquetFile("train-00000-of-00124.parquet").iter_batches(batch_size=8):
+        batch_board, batch_evaluations = torch.tensor([]), torch.tensor([])
+        for fen, cp in zip(batch["fen"], batch["cp"]):
+            board = NanoNNUE.encode_fen_to_features(fen)
+            cp = torch.tensor(cp.as_py() / 100.0)
+            batch_board = torch.cat((batch_board, torch.unsqueeze(board, 0)))
+            batch_evaluations = torch.cat((batch_evaluations, torch.unsqueeze(cp, 0)))
+
+        model.train()
+
+        while 1: # NOTE: overfit the first batch
+            loss = model.loss(batch_board, batch_evaluations)
+            loss.backward()
+            optimizer.step()
+            print(f"Training loss: {loss}")
