@@ -3,10 +3,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 
-NUM_PIECES = 11 # 1 our pawn, 2 our knight, 3 our bishop, 4 our rook, 5 our queen, 6-10 other pieces, 11 other king
+NUM_PIECES = 10 # 1 our pawn, 2 our knight, 3 our bishop, 4 our rook, 5 our queen, 6-10 other pieces
 NUM_SQUARES = 64
 NUM_VECTORS = NUM_SQUARES * NUM_SQUARES # 4096
-NUM_FEATURES = NUM_PIECES * NUM_SQUARES * NUM_SQUARES # (other piece, other piece, our king location)
+NUM_FEATURES = NUM_PIECES * NUM_SQUARES * NUM_SQUARES # (other piece type, other piece location, our king location)
 CHANNEL_ROT = 16
 
 class Embedding(nn.Module):
@@ -89,25 +89,70 @@ class NanoNNUE(nn.Module):
             nn.Linear(32, 1) # TODO: maybe have 8, one for each game stage
         )
 
-    @staticmethod
-    def encode_fen_to_features(position):
-        '''
-        position: fen string
-        returns: tuple of black embedding and white embedding
-        '''
-        # TODO
-        pass
-
     def forward(self, features):
-        black_embedding = self.half_kp.forward(features[0])
-        white_embedding = self.half_kp.forward(features[1])
-        total_embedding = torch.cat((black_embedding, white_embedding), dim=1)
+        us_embedding = self.half_kp.forward(features[0])
+        them_embedding = self.half_kp.forward(features[1])
+        total_embedding = torch.cat((us_embedding, them_embedding), dim=1)
         return self.seq.forward(total_embedding)
 
     def loss(self, x, y_exp, loss_fn=nn.MSELoss):
         y = self.forward(x)
         regression_loss = loss_fn(y, y_exp)
-        return regression_loss + self.half_kp.regularization_loss()
+        return regression_loss + self.half_kp.regularization_loss(0, 0, 1) # TODO: check other regularization as well
+
+class Features:
+    @staticmethod
+    def feature_idx(piece, is_us, piece_pos, our_king_pos):
+        # pos is (file, rank)
+        # rank is [0,7], 0 is rank closest to player, 7 is rank furthest away from player
+        # file is [0,7], 0 is file furthest left, 7 is rank furthest right
+        piece_pos_idx = piece_pos[0] + piece_pos[1] * 8
+        our_king_pos_idx = our_king_pos[0] * our_king_pos[1] * 8
+        piece_map = dict(p=0, k=1, b=2, r=3, q=4) if is_us else dict(p=5, k=6, b=7, r=8, q=9)
+        piece_num = piece_map[piece]
+        return our_king_pos_idx + NUM_SQUARES * piece_pos_idx + (NUM_SQUARES ** 2) * piece_num
+
+    @staticmethod
+    def parse_fen(fen):
+        board, turn, _, _, _, _ = fen.split(" ")
+        rows = board.split("/")
+        white_positions = dict()
+        black_positions = dict()
+        for rank, row in enumerate(reversed(rows)):
+            file = 0
+            for char in row:
+                if char.isdigit():
+                    file += int(char)
+                elif char.isalpha():
+                    is_white = char.isupper()
+                    piece = char.lower()
+                    pos = (file, rank)
+                    file += 1
+                    positions = white_positions if is_white else black_positions
+                    positions.setdefault(piece, []).append(pos)
+        return white_positions, black_positions, turn
+
+    @staticmethod
+    def encode_fen_to_features(fen):
+        '''
+        position: fen string
+        returns: tuple of black embedding and white embedding
+        '''
+        white = torch.zeros(NUM_FEATURES)
+
+        white_positions, black_positions, turn = Features.parse_fen(fen)
+        
+        # flip black positions to align with perspective
+        for piece, positions in black_positions.items():
+            black_positions[piece] = [(7 - file, 7 - rank) for file, rank in positions]
+
+        # TODO: rest
+        pass
+
+
+print(Features.parse_fen("8/8/2B3N1/5p2/6p1/6pk/4K2b/7r w - - 0 1"))
+
+# TODO: tune over regularization parameters
 
 if __name__ == "__main__":
     from pyarrow import parquet as pq
