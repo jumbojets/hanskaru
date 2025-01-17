@@ -3,6 +3,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 
+# device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+device = "cpu"
+
 NUM_PIECES = 10 # 1 our pawn, 2 our knight, 3 our bishop, 4 our rook, 5 our queen, 6-10 other pieces
 NUM_SQUARES = 64
 NUM_VECTORS = NUM_SQUARES * NUM_SQUARES # 4096
@@ -32,16 +35,18 @@ class Embedding(nn.Module):
         '''
         batch_size, _ = active_features.shape
 
+        indices_logits = self.indices_logits.to(active_features.device)
         indices_logits = self.indices_logits.reshape(1, NUM_FEATURES, NUM_VECTORS).expand(batch_size, -1, -1)
-        indices_sample = F.gumbel_softmax(indices_logits, tau=1.0, hard=True)
+        # indices_sample = F.gumbel_softmax(indices_logits, tau=1.0, hard=True)
+        indices_sample = F.gumbel_softmax(indices_logits, tau=1.0, hard=False)
 
         num_piece_features = NUM_FEATURES // NUM_PIECES
         position_embedding = torch.zeros(batch_size, self.vector_dim, device=active_features.device)
         for piece_idx in range(NUM_PIECES):
             start_idx = piece_idx * num_piece_features
             end_idx = (piece_idx + 1) * num_piece_features
-            piece_probs = indices_sample[:, start_idx:end_idx, :]
-            piece_shared_vectors = self.shared_vectors[piece_idx]
+            piece_probs = indices_sample[:, start_idx:end_idx, :].to(active_features.device)
+            piece_shared_vectors = self.shared_vectors[piece_idx].to(active_features.device)
             piece_vectors = torch.einsum("bqv,vd->bd", piece_probs, piece_shared_vectors)
             position_embedding += piece_vectors
 
@@ -90,15 +95,15 @@ class NanoNNUE(nn.Module):
         )
 
     def forward(self, features):
-        us_embedding = self.half_kp.forward(features[0])
-        them_embedding = self.half_kp.forward(features[1])
+        us_embedding = self.half_kp.forward(features[:,0,:])
+        them_embedding = self.half_kp.forward(features[:,1,:])
         total_embedding = torch.cat((us_embedding, them_embedding), dim=1)
         return self.seq.forward(total_embedding)
 
-    def loss(self, x, y_exp, loss_fn=nn.MSELoss):
+    def loss(self, x, y_exp, loss_fn=nn.MSELoss()):
         y = self.forward(x)
         regression_loss = loss_fn(y, y_exp)
-        return regression_loss + self.half_kp.regularization_loss(0, 0, 1) # TODO: check other regularization as well
+        return regression_loss #+ self.half_kp.regularization_loss(0, 0, 1) # TODO: check other regularization as well
 
 class Features:
     @staticmethod
@@ -108,13 +113,13 @@ class Features:
         # file is [0,7], 0 is file furthest left, 7 is rank furthest right
         piece_pos_idx = piece_pos[0] + piece_pos[1] * 8
         our_king_pos_idx = our_king_pos[0] * our_king_pos[1] * 8
-        piece_map = dict(p=0, k=1, b=2, r=3, q=4) if is_us else dict(p=5, k=6, b=7, r=8, q=9)
+        piece_map = dict(p=0, n=1, b=2, r=3, q=4) if is_us else dict(p=5, n=6, b=7, r=8, q=9)
         piece_num = piece_map[piece]
         return our_king_pos_idx + NUM_SQUARES * piece_pos_idx + (NUM_SQUARES ** 2) * piece_num
 
     @staticmethod
     def parse_fen(fen):
-        board, turn, _, _, _, _ = fen.split(" ")
+        board, turn, _, _, = fen.split(" ")
         rows = board.split("/")
         white_positions = dict()
         black_positions = dict()
@@ -138,34 +143,59 @@ class Features:
         position: fen string
         returns: tuple of black embedding and white embedding
         '''
-        white = torch.zeros(NUM_FEATURES)
-
         white_positions, black_positions, turn = Features.parse_fen(fen)
         
-        # flip black positions to align with perspective
-        for piece, positions in black_positions.items():
-            black_positions[piece] = [(7 - file, 7 - rank) for file, rank in positions]
+        def flip_positions(color_positions):
+            # flip positions for "them" perspective
+            for piece, positions in color_positions.items():
+                color_positions[piece] = [(7 - file, 7 - rank) for file, rank in positions]
+            return color_positions
 
-        # TODO: rest
-        pass
+        if turn == "w":
+            us = white_positions
+            them = black_positions
+        else:
+            us = flip_positions(black_positions)
+            them = flip_positions(white_positions)
 
+        us_features, them_features = torch.zeros(NUM_FEATURES), torch.zeros(NUM_FEATURES)
+        us_king_pos, them_king_pos = us["k"][0], them["k"][0]
 
-print(Features.parse_fen("8/8/2B3N1/5p2/6p1/6pk/4K2b/7r w - - 0 1"))
+        for piece, positions in us.items():
+            if piece == "k": continue
+            for pos in positions:
+                us_idx = Features.feature_idx(piece, True, pos, us_king_pos)
+                them_idx = Features.feature_idx(piece, False, pos, them_king_pos)
+                us_features[us_idx] = 1.0
+                them_features[them_idx] = 1.0
+
+        for piece, positions in them.items():
+            if piece == "k": continue
+            for pos in positions:
+                us_idx = Features.feature_idx(piece, False, pos, us_king_pos)
+                them_idx = Features.feature_idx(piece, True, pos, them_king_pos)
+                us_features[us_idx] = 1.0
+                them_features[them_idx] = 1.0
+
+        return torch.stack([us_features, them_features])
+
+print(Features.parse_fen("8/8/2B3N1/5p2/6p1/6pk/4K2b/7r w - -"))
+Features.encode_fen_to_features("8/8/2B3N1/5p2/6p1/6pk/4K2b/7r w - -")
 
 # TODO: tune over regularization parameters
 
 if __name__ == "__main__":
     from pyarrow import parquet as pq
-    import pyarrow as pa
 
-    model = NanoNNUE()
+    model = NanoNNUE().to(device)
     optimizer = optim.Adam(model.parameters())
 
-    for batch in pq.ParquetFile("train-00000-of-00124.parquet").iter_batches(batch_size=8):
-        batch_board, batch_evaluations = torch.tensor([]), torch.tensor([])
+    for batch in pq.ParquetFile("train-00000-of-00124.parquet").iter_batches(batch_size=4):
+        batch_board, batch_evaluations = torch.tensor([], device=device), torch.tensor([], device=device)
         for fen, cp in zip(batch["fen"], batch["cp"]):
-            board = NanoNNUE.encode_fen_to_features(fen)
-            cp = torch.tensor(cp.as_py() / 100.0)
+            print(fen.as_py())
+            board = Features.encode_fen_to_features(fen.as_py()).to(device)
+            cp = torch.tensor(cp.as_py() / 100.0).to(device)
             batch_board = torch.cat((batch_board, torch.unsqueeze(board, 0)))
             batch_evaluations = torch.cat((batch_evaluations, torch.unsqueeze(cp, 0)))
 
