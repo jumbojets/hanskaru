@@ -38,7 +38,7 @@ class Embedding(nn.Module):
         indices_logits = self.indices_logits.to(active_features.device)
         indices_logits = self.indices_logits.reshape(1, NUM_FEATURES, NUM_VECTORS).expand(batch_size, -1, -1)
         # indices_sample = F.gumbel_softmax(indices_logits, tau=1.0, hard=True)
-        indices_sample = F.gumbel_softmax(indices_logits, tau=1.0, hard=False)
+        indices_sample = F.gumbel_softmax(indices_logits, tau=0.001, hard=False)
 
         num_piece_features = NUM_FEATURES // NUM_PIECES
         position_embedding = torch.zeros(batch_size, self.vector_dim, device=active_features.device)
@@ -184,25 +184,41 @@ Features.encode_fen_to_features("8/8/2B3N1/5p2/6p1/6pk/4K2b/7r w - -")
 
 # TODO: tune over regularization parameters
 
+BATCH_SIZE = 256
+MICRO_BATCH_SIZE = 4
+
 if __name__ == "__main__":
     from pyarrow import parquet as pq
+    from tqdm import trange
 
     model = NanoNNUE().to(device)
     optimizer = optim.Adam(model.parameters())
 
-    for batch in pq.ParquetFile("train-00000-of-00124.parquet").iter_batches(batch_size=4):
-        batch_board, batch_evaluations = torch.tensor([], device=device), torch.tensor([], device=device)
-        for fen, cp in zip(batch["fen"], batch["cp"]):
-            print(fen.as_py())
-            board = Features.encode_fen_to_features(fen.as_py()).to(device)
+    for batch in pq.ParquetFile("train-00000-of-00124.parquet").iter_batches(batch_size=BATCH_SIZE):
+        batch_boards, batch_evaluations = torch.tensor([], device=device), torch.tensor([], device=device)
+        for fen, cp, mate in zip(batch["fen"], batch["cp"], batch["mate"]):
+            board = Features.encode_fen_to_features(fen.as_py()).to("cpu")
+            if cp.as_py() is None: cp = mate
             cp = torch.tensor(cp.as_py() / 100.0).to(device)
-            batch_board = torch.cat((batch_board, torch.unsqueeze(board, 0)))
+            batch_boards = torch.cat((batch_boards, torch.unsqueeze(board, 0)))
             batch_evaluations = torch.cat((batch_evaluations, torch.unsqueeze(cp, 0)))
 
         model.train()
 
-        while 1: # NOTE: overfit the first batch
-            loss = model.loss(batch_board, batch_evaluations)
-            loss.backward()
+        while 1: # overfit the first batch
+            grad_accum_steps = BATCH_SIZE // MICRO_BATCH_SIZE
+            total_loss = 0
+            for i in (pbar:=trange(grad_accum_steps)):
+                micro_batch_boards = batch_boards[i*MICRO_BATCH_SIZE:(i+1)*MICRO_BATCH_SIZE,:,:].to(device)
+                micro_batch_evaluations = batch_evaluations[i*MICRO_BATCH_SIZE:(i+1)*MICRO_BATCH_SIZE].to(device)
+                loss = model.loss(micro_batch_boards, micro_batch_evaluations)
+                lossf = loss.item()
+                total_loss += lossf / grad_accum_steps
+                loss.backward()
+
+                pbar.set_postfix({"loss": f"{lossf:.4f}"})
+                pbar.update(1)
+                
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
-            print(f"Training loss: {loss}")
+            print(f"Training loss: {total_loss}")
