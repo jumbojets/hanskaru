@@ -3,8 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 
-# device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-device = "cpu"
+device = "cuda"
 
 NUM_PIECES = 10 # 1 our pawn, 2 our knight, 3 our bishop, 4 our rook, 5 our queen, 6-10 other pieces
 NUM_SQUARES = 64
@@ -38,6 +37,8 @@ class Embedding(nn.Module):
         indices_logits = self.indices_logits.to(active_features.device)
         indices_logits = self.indices_logits.reshape(1, NUM_FEATURES, NUM_VECTORS).expand(batch_size, -1, -1)
         # indices_sample = F.gumbel_softmax(indices_logits, tau=1.0, hard=True)
+        # indices_sample = F.gumbel_softmax(indices_logits, tau=0.001, hard=True)
+        # indices_sample = F.gumbel_softmax(indices_logits, tau=1.0, hard=False)
         indices_sample = F.gumbel_softmax(indices_logits, tau=0.001, hard=False)
 
         num_piece_features = NUM_FEATURES // NUM_PIECES
@@ -45,6 +46,7 @@ class Embedding(nn.Module):
         for piece_idx in range(NUM_PIECES):
             start_idx = piece_idx * num_piece_features
             end_idx = (piece_idx + 1) * num_piece_features
+            # TODO: i think the the three lines below can be combined into a single einsum if i change dims of piece_probs
             piece_probs = indices_sample[:, start_idx:end_idx, :].to(active_features.device)
             piece_shared_vectors = self.shared_vectors[piece_idx].to(active_features.device)
             piece_vectors = torch.einsum("bqv,vd->bd", piece_probs, piece_shared_vectors)
@@ -191,34 +193,39 @@ if __name__ == "__main__":
     from pyarrow import parquet as pq
     from tqdm import trange
 
+    torch.set_float32_matmul_precision('high')
+
     model = NanoNNUE().to(device)
     optimizer = optim.Adam(model.parameters())
 
     for batch in pq.ParquetFile("train-00000-of-00124.parquet").iter_batches(batch_size=BATCH_SIZE):
-        batch_boards, batch_evaluations = torch.tensor([], device=device), torch.tensor([], device=device)
+        batch_boards, batch_evaluations = torch.tensor([], device="cpu"), torch.tensor([], device="cpu")
         for fen, cp, mate in zip(batch["fen"], batch["cp"], batch["mate"]):
             board = Features.encode_fen_to_features(fen.as_py()).to("cpu")
             if cp.as_py() is None: cp = mate
-            cp = torch.tensor(cp.as_py() / 100.0).to(device)
+            cp = torch.tensor(cp.as_py() / 100.0).to("cpu")
             batch_boards = torch.cat((batch_boards, torch.unsqueeze(board, 0)))
             batch_evaluations = torch.cat((batch_evaluations, torch.unsqueeze(cp, 0)))
 
         model.train()
 
         while 1: # overfit the first batch
-            grad_accum_steps = BATCH_SIZE // MICRO_BATCH_SIZE
-            total_loss = 0
-            for i in (pbar:=trange(grad_accum_steps)):
-                micro_batch_boards = batch_boards[i*MICRO_BATCH_SIZE:(i+1)*MICRO_BATCH_SIZE,:,:].to(device)
-                micro_batch_evaluations = batch_evaluations[i*MICRO_BATCH_SIZE:(i+1)*MICRO_BATCH_SIZE].to(device)
-                loss = model.loss(micro_batch_boards, micro_batch_evaluations)
-                lossf = loss.item()
-                total_loss += lossf / grad_accum_steps
-                loss.backward()
+            @torch.compile
+            def train_step():
+                grad_accum_steps = BATCH_SIZE // MICRO_BATCH_SIZE
+                total_loss = 0
+                for i in (pbar:=trange(grad_accum_steps)):
+                    micro_batch_boards = batch_boards[i*MICRO_BATCH_SIZE:(i+1)*MICRO_BATCH_SIZE,:,:].to(device)
+                    micro_batch_evaluations = batch_evaluations[i*MICRO_BATCH_SIZE:(i+1)*MICRO_BATCH_SIZE].to(device)
+                    loss = model.loss(micro_batch_boards, micro_batch_evaluations)
+                    lossf = loss.item()
+                    total_loss += lossf / grad_accum_steps
+                    loss.backward()
 
-                pbar.set_postfix({"loss": f"{lossf:.4f}"})
-                pbar.update(1)
-                
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            print(f"Training loss: {total_loss}")
+                    pbar.set_postfix({"loss": f"{lossf:.4f}"})
+                    pbar.update(1)
+                    
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                print(f"Training loss: {total_loss}")
+            train_step()
