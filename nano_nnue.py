@@ -121,7 +121,8 @@ class Features:
 
     @staticmethod
     def parse_fen(fen):
-        board, turn, _, _, = fen.split(" ")
+        split_fen = fen.split(" ")
+        board, turn = split_fen[0], split_fen[1]
         rows = board.split("/")
         white_positions = dict()
         black_positions = dict()
@@ -184,29 +185,41 @@ class Features:
 print(Features.parse_fen("8/8/2B3N1/5p2/6p1/6pk/4K2b/7r w - -"))
 Features.encode_fen_to_features("8/8/2B3N1/5p2/6p1/6pk/4K2b/7r w - -")
 
-# TODO: tune over regularization parameters
-
-BATCH_SIZE = 256
+BATCH_SIZE = 128
 MICRO_BATCH_SIZE = 4
+
+import re
+pattern = re.compile(r"^#([+-])(\d+)$")
+def convert_cp(s: str) -> float:
+    """Convert s to a float:
+       - If s matches "#+x", return 10.0
+       - If s matches "#-x", return -10.0
+       - Otherwise, parse s as a regular float
+    """
+    match = pattern.match(s)
+    if match:
+        sign, _ = match.groups()
+        return 10.0 if sign == '+' else -10.0
+    return float(s) / 100
 
 if __name__ == "__main__":
     from pyarrow import parquet as pq
-    from tqdm import trange
 
-    torch.set_float32_matmul_precision('high')
+    torch.set_float32_matmul_precision('medium')
 
     model = NanoNNUE().to(device)
     optimizer = optim.Adam(model.parameters())
 
-    for batch in pq.ParquetFile("train-00000-of-00124.parquet").iter_batches(batch_size=BATCH_SIZE):
+    for batch in pq.ParquetFile("train-00000-of-00002.parquet").iter_batches(batch_size=BATCH_SIZE):
         batch_boards, batch_evaluations = torch.tensor([], device="cpu"), torch.tensor([], device="cpu")
-        for fen, cp, mate in zip(batch["fen"], batch["cp"], batch["mate"]):
-            board = Features.encode_fen_to_features(fen.as_py()).to("cpu")
-            if cp.as_py() is None: cp = mate
-            cp = torch.tensor(cp.as_py() / 100.0).to("cpu")
+        for fen, cp, i in zip(batch["FEN"], batch["Evaluation"], range(BATCH_SIZE)):
+            fen = fen.as_py()
+            turn = fen.split(" ")[1]
+            board = Features.encode_fen_to_features(fen).to("cpu")
+            cp = torch.tensor(convert_cp(cp.as_py()) / 100.0).to("cpu")
+            if turn == "b": cp = -cp
             batch_boards = torch.cat((batch_boards, torch.unsqueeze(board, 0)))
             batch_evaluations = torch.cat((batch_evaluations, torch.unsqueeze(cp, 0)))
-
         model.train()
 
         while 1: # overfit the first batch
@@ -214,16 +227,13 @@ if __name__ == "__main__":
             def train_step():
                 grad_accum_steps = BATCH_SIZE // MICRO_BATCH_SIZE
                 total_loss = 0
-                for i in (pbar:=trange(grad_accum_steps)):
+                for i in range(grad_accum_steps):
                     micro_batch_boards = batch_boards[i*MICRO_BATCH_SIZE:(i+1)*MICRO_BATCH_SIZE,:,:].to(device)
                     micro_batch_evaluations = batch_evaluations[i*MICRO_BATCH_SIZE:(i+1)*MICRO_BATCH_SIZE].to(device)
                     loss = model.loss(micro_batch_boards, micro_batch_evaluations)
                     lossf = loss.item()
                     total_loss += lossf / grad_accum_steps
                     loss.backward()
-
-                    pbar.set_postfix({"loss": f"{lossf:.4f}"})
-                    pbar.update(1)
                     
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
