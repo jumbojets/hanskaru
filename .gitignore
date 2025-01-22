@@ -1,2 +1,5 @@
-*.parquet
 .venv
+__pycache__
+
+data/*
+!data/download.sh

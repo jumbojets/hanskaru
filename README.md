@@ -1,9 +1,8 @@
 # hanskaru
 
-[Position evaluation dataset](https://huggingface.co/datasets/ssingh22/chess-evaluations)
-[Another good one](https://huggingface.co/datasets/Lichess/chess-position-evaluations)
-
 [Inspiration](https://www.kaggle.com/competitions/fide-google-efficiency-chess-ai-challenge/discussion/551257)
+
+[Searchless chess and dataset](https://github.com/google-deepmind/searchless_chess/tree/main)
 
 [NNUE and HalfKP](https://github.com/official-stockfish/nnue-pytorch/blob/master/docs/nnue.md#halfkp)
 

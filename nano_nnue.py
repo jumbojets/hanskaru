@@ -114,7 +114,7 @@ class Features:
         # rank is [0,7], 0 is rank closest to player, 7 is rank furthest away from player
         # file is [0,7], 0 is file furthest left, 7 is rank furthest right
         piece_pos_idx = piece_pos[0] + piece_pos[1] * 8
-        our_king_pos_idx = our_king_pos[0] * our_king_pos[1] * 8
+        our_king_pos_idx = our_king_pos[0] + our_king_pos[1] * 8
         piece_map = dict(p=0, n=1, b=2, r=3, q=4) if is_us else dict(p=5, n=6, b=7, r=8, q=9)
         piece_num = piece_map[piece]
         return our_king_pos_idx + NUM_SQUARES * piece_pos_idx + (NUM_SQUARES ** 2) * piece_num
@@ -167,6 +167,9 @@ class Features:
         for piece, positions in us.items():
             if piece == "k": continue
             for pos in positions:
+                # print(pos)
+                # print(piece)
+                # print(them_king_pos)
                 us_idx = Features.feature_idx(piece, True, pos, us_king_pos)
                 them_idx = Features.feature_idx(piece, False, pos, them_king_pos)
                 us_features[us_idx] = 1.0
@@ -185,52 +188,46 @@ class Features:
 print(Features.parse_fen("8/8/2B3N1/5p2/6p1/6pk/4K2b/7r w - -"))
 Features.encode_fen_to_features("8/8/2B3N1/5p2/6p1/6pk/4K2b/7r w - -")
 
+# TODO: full dataloader
+# TODO: validation
+# TODO: investigate regularization
+
+from apache_beam import coders
+decode = coders.TupleCoder((coders.StrUtf8Coder(), coders.FloatCoder())).decode
+
 BATCH_SIZE = 128
 MICRO_BATCH_SIZE = 4
 
-import re
-pattern = re.compile(r"^#([+-])(\d+)$")
-def convert_cp(s: str) -> float:
-    """Convert s to a float:
-       - If s matches "#+x", return 10.0
-       - If s matches "#-x", return -10.0
-       - Otherwise, parse s as a regular float
-    """
-    match = pattern.match(s)
-    if match:
-        sign, _ = match.groups()
-        return 10.0 if sign == '+' else -10.0
-    return float(s) / 100
-
 if __name__ == "__main__":
-    from pyarrow import parquet as pq
+    from itertools import batched
+    from bagz import BagFileReader
 
     torch.set_float32_matmul_precision('medium')
 
     model = NanoNNUE().to(device)
     optimizer = optim.Adam(model.parameters())
 
-    for batch in pq.ParquetFile("train-00000-of-00002.parquet").iter_batches(batch_size=BATCH_SIZE):
-        batch_boards, batch_evaluations = torch.tensor([], device="cpu"), torch.tensor([], device="cpu")
-        for fen, cp, i in zip(batch["FEN"], batch["Evaluation"], range(BATCH_SIZE)):
-            fen = fen.as_py()
+    for batch in batched(BagFileReader("data/train/action_value-00000-of-02148_data.bag"), BATCH_SIZE):
+        batch_boards, batch_probs = torch.tensor([], device="cpu"), torch.tensor([], device="cpu")
+
+        for fen, prob in map(decode, batch):
+            print(fen)
             turn = fen.split(" ")[1]
             board = Features.encode_fen_to_features(fen).to("cpu")
-            cp = torch.tensor(convert_cp(cp.as_py()) / 100.0).to("cpu")
-            if turn == "b": cp = -cp
+            prob = torch.tensor(prob).to("cpu")
             batch_boards = torch.cat((batch_boards, torch.unsqueeze(board, 0)))
-            batch_evaluations = torch.cat((batch_evaluations, torch.unsqueeze(cp, 0)))
+            batch_probs = torch.cat((batch_probs, torch.unsqueeze(prob, 0)))
         model.train()
 
         while 1: # overfit the first batch
-            @torch.compile
+            # @torch.compile
             def train_step():
                 grad_accum_steps = BATCH_SIZE // MICRO_BATCH_SIZE
                 total_loss = 0
                 for i in range(grad_accum_steps):
                     micro_batch_boards = batch_boards[i*MICRO_BATCH_SIZE:(i+1)*MICRO_BATCH_SIZE,:,:].to(device)
-                    micro_batch_evaluations = batch_evaluations[i*MICRO_BATCH_SIZE:(i+1)*MICRO_BATCH_SIZE].to(device)
-                    loss = model.loss(micro_batch_boards, micro_batch_evaluations)
+                    micro_batch_probs = batch_probs[i*MICRO_BATCH_SIZE:(i+1)*MICRO_BATCH_SIZE].to(device)
+                    loss = model.loss(micro_batch_boards, micro_batch_probs)
                     lossf = loss.item()
                     total_loss += lossf / grad_accum_steps
                     loss.backward()
