@@ -84,12 +84,6 @@ class Embedding(nn.Module):
 
     def regularization_loss(self, l1, l2, l3):
         return l1 * self.regularization_king_square() + l2 * self.regularization_neighboring_squares() + l3 * self.regularization_index_penalty()
-    
-    def load_checkpoint():
-        pass
-
-    def save_checkpoint():
-        pass
 
 class NanoNNUE(nn.Module):
     def __init__(self):
@@ -114,25 +108,28 @@ class NanoNNUE(nn.Module):
         regression_loss = loss_fn(y, y_exp)
         return regression_loss #+ self.half_kp.regularization_loss(0, 0, 1) # TODO: check other regularization as well
 
-
-# TODO: validation
 # TODO: investigate regularization
+# TODO: validation with argmax probabilities
 
 NUM_EPOCHS = 5
 BATCH_SIZE = 128
 MICRO_BATCH_SIZE = 4
-VALID_EVERY = 500
+VALID_EVERY = 1000
 VALID_BATCH_SIZE = 8
 NUM_VALID_SAMPLES = 131072
 
 if __name__ == "__main__":
     curr_dir = os.path.dirname(os.path.abspath(__file__))
+
     train_dataset = ChessBench(os.path.join(curr_dir, "data/train/action_value@0004_data.bag"), sharded=True)
     valid_dataset = ChessBench(os.path.join(curr_dir, "data/test/action_value_data.bag"))
     small_valid_dataset = Subset(valid_dataset, range(NUM_VALID_SAMPLES))
 
     train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=chessbench_collate)
     valid_dataloader = DataLoader(small_valid_dataset, batch_size=VALID_BATCH_SIZE, shuffle=False, collate_fn=chessbench_collate)
+
+    checkpoint_dir = os.path.join(curr_dir, "checkpoints")
+    if not os.path.exists(checkpoint_dir): os.makedirs(checkpoint_dir)
 
     torch.set_float32_matmul_precision('medium')
 
@@ -172,7 +169,7 @@ if __name__ == "__main__":
                 count += 1
         avg_val_loss = total_val_loss / count if count else 0
         return avg_val_loss
-    
+
     step = 0
 
     for epoch in range(NUM_EPOCHS):
@@ -182,8 +179,18 @@ if __name__ == "__main__":
             st = time.monotonic()
             loss = train_step(boards_batch, probs_batch)
             elapsed = time.monotonic() - st
-            print(f"step {step}: training loss: {loss:.6f} ({elapsed:.4f}s)")
+            print(f"step {step}: training loss: {loss} ({elapsed:.4f}s)")
 
-            if step % VALID_EVERY == 0: print(f"==> Validation loss at step {step}: {valid_loss():.6f}")
+            if step % VALID_EVERY == 0:
+                vloss = valid_loss()
+                print(f"==> validation loss at step {step}: {vloss}")
+                checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint-{epoch}-{step}.pt")
+                torch.save({
+                    "epoch": epoch,
+                    "step": step,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "loss": vloss
+                }, checkpoint_path)
 
             step += 1
