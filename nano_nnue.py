@@ -2,7 +2,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
+
+import os, time
+from tqdm import tqdm
 
 from constants import *
 from chessbench import ChessBench, collate as chessbench_collate
@@ -34,10 +37,10 @@ class Embedding(nn.Module):
 
         indices_logits = self.indices_logits.to(active_features.device)
         indices_logits = self.indices_logits.reshape(1, NUM_FEATURES, NUM_VECTORS).expand(batch_size, -1, -1)
-        # indices_sample = F.gumbel_softmax(indices_logits, tau=1.0, hard=True)
+        indices_sample = F.gumbel_softmax(indices_logits, tau=1.0, hard=True)
         # indices_sample = F.gumbel_softmax(indices_logits, tau=0.001, hard=True)
         # indices_sample = F.gumbel_softmax(indices_logits, tau=1.0, hard=False)
-        indices_sample = F.gumbel_softmax(indices_logits, tau=0.001, hard=False)
+        # indices_sample = F.gumbel_softmax(indices_logits, tau=0.001, hard=False)
 
         num_piece_features = NUM_FEATURES // NUM_PIECES
         position_embedding = torch.zeros(batch_size, self.vector_dim, device=active_features.device)
@@ -81,6 +84,12 @@ class Embedding(nn.Module):
 
     def regularization_loss(self, l1, l2, l3):
         return l1 * self.regularization_king_square() + l2 * self.regularization_neighboring_squares() + l3 * self.regularization_index_penalty()
+    
+    def load_checkpoint():
+        pass
+
+    def save_checkpoint():
+        pass
 
 class NanoNNUE(nn.Module):
     def __init__(self):
@@ -109,22 +118,26 @@ class NanoNNUE(nn.Module):
 # TODO: validation
 # TODO: investigate regularization
 
-NUM_EPOCHS = 1
+NUM_EPOCHS = 5
 BATCH_SIZE = 128
 MICRO_BATCH_SIZE = 4
+VALID_EVERY = 500
+VALID_BATCH_SIZE = 8
+NUM_VALID_SAMPLES = 131072
 
 if __name__ == "__main__":
-    train_dataset = ChessBench("data/train/action_value-@2148_data.bag", sharded=True)
-    valid_dataset = ChessBench("data/valid/action_value_valid_data.bag")
+    curr_dir = os.path.dirname(os.path.abspath(__file__))
+    train_dataset = ChessBench(os.path.join(curr_dir, "data/train/action_value@0004_data.bag"), sharded=True)
+    valid_dataset = ChessBench(os.path.join(curr_dir, "data/test/action_value_data.bag"))
+    small_valid_dataset = Subset(valid_dataset, range(NUM_VALID_SAMPLES))
 
     train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=chessbench_collate)
-    valid_dataloader = DataLoader(valid_dataset, batch_size=32, shuffle=False, collate_fn=chessbench_collate)
+    valid_dataloader = DataLoader(small_valid_dataset, batch_size=VALID_BATCH_SIZE, shuffle=False, collate_fn=chessbench_collate)
 
     torch.set_float32_matmul_precision('medium')
 
     model = NanoNNUE().to(device)
     optimizer = optim.Adam(model.parameters())
-
 
     @torch.compile()
     def train_step(boards_batch, probs_batch):
@@ -151,7 +164,7 @@ if __name__ == "__main__":
         total_val_loss = 0.0
         count = 0
         with torch.no_grad():
-            for boards_batch, probs_batch in valid_dataloader:
+            for boards_batch, probs_batch in tqdm(valid_dataloader):
                 boards_batch = boards_batch.to(device)
                 probs_batch = probs_batch.to(device)
                 loss = model.loss(boards_batch, probs_batch)
@@ -160,14 +173,17 @@ if __name__ == "__main__":
         avg_val_loss = total_val_loss / count if count else 0
         return avg_val_loss
     
-
     step = 0
 
     for epoch in range(NUM_EPOCHS):
         print(f"starting epoch: {epoch}")
-        for boards_batch, probs_batch in train_dataset:
+        for boards_batch, probs_batch in train_dataloader:
 
+            st = time.monotonic()
             loss = train_step(boards_batch, probs_batch)
-            print(f"step {step}: training loss: {loss:.4f}")
+            elapsed = time.monotonic() - st
+            print(f"step {step}: training loss: {loss:.6f} ({elapsed:.4f}s)")
+
+            if step % VALID_EVERY == 0: print(f"==> Validation loss at step {step}: {valid_loss():.6f}")
 
             step += 1

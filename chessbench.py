@@ -67,9 +67,6 @@ class Features:
         for piece, positions in us.items():
             if piece == "k": continue
             for pos in positions:
-                # print(pos)
-                # print(piece)
-                # print(them_king_pos)
                 us_idx = Features.feature_idx(piece, True, pos, us_king_pos)
                 them_idx = Features.feature_idx(piece, False, pos, them_king_pos)
                 us_features[us_idx] = 1.0
@@ -85,9 +82,6 @@ class Features:
 
         return torch.stack([us_features, them_features])
 
-print(Features.parse_fen("8/8/2B3N1/5p2/6p1/6pk/4K2b/7r w - -"))
-Features.encode_fen_to_features("8/8/2B3N1/5p2/6p1/6pk/4K2b/7r w - -")
-
 class ChessBench(Dataset):
     def __init__(self, path, sharded=False):
         self.reader = BagShardReader(path) if sharded else BagFileReader(path)
@@ -97,7 +91,7 @@ class ChessBench(Dataset):
         return self.length
     
     def __getitem__(self, index: int):
-        record = self._reader[index]
+        record = self.reader[index]
         fen, prob = decode(record)
         board_tensor = Features.encode_fen_to_features(fen).to("cpu")
         prob_tensor = torch.tensor(prob, dtype=torch.float, device="cpu")

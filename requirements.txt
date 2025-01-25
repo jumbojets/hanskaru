@@ -3,3 +3,4 @@ zstandard
 etils
 apache_beam
 importlib_resources
+tqdm
