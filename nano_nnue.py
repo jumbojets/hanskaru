@@ -2,14 +2,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from torch.utils.data import DataLoader
+
+from constants import *
+from chessbench import ChessBench, collate as chessbench_collate
 
 device = "cuda"
-
-NUM_PIECES = 10 # 1 our pawn, 2 our knight, 3 our bishop, 4 our rook, 5 our queen, 6-10 other pieces
-NUM_SQUARES = 64
-NUM_VECTORS = NUM_SQUARES * NUM_SQUARES # 4096
-NUM_FEATURES = NUM_PIECES * NUM_SQUARES * NUM_SQUARES # (other piece type, other piece location, our king location)
-CHANNEL_ROT = 16
 
 class Embedding(nn.Module):
     def __init__(self, vector_dim=256, random_seed=42):
@@ -107,132 +105,69 @@ class NanoNNUE(nn.Module):
         regression_loss = loss_fn(y, y_exp)
         return regression_loss #+ self.half_kp.regularization_loss(0, 0, 1) # TODO: check other regularization as well
 
-class Features:
-    @staticmethod
-    def feature_idx(piece, is_us, piece_pos, our_king_pos):
-        # pos is (file, rank)
-        # rank is [0,7], 0 is rank closest to player, 7 is rank furthest away from player
-        # file is [0,7], 0 is file furthest left, 7 is rank furthest right
-        piece_pos_idx = piece_pos[0] + piece_pos[1] * 8
-        our_king_pos_idx = our_king_pos[0] + our_king_pos[1] * 8
-        piece_map = dict(p=0, n=1, b=2, r=3, q=4) if is_us else dict(p=5, n=6, b=7, r=8, q=9)
-        piece_num = piece_map[piece]
-        return our_king_pos_idx + NUM_SQUARES * piece_pos_idx + (NUM_SQUARES ** 2) * piece_num
 
-    @staticmethod
-    def parse_fen(fen):
-        split_fen = fen.split(" ")
-        board, turn = split_fen[0], split_fen[1]
-        rows = board.split("/")
-        white_positions = dict()
-        black_positions = dict()
-        for rank, row in enumerate(reversed(rows)):
-            file = 0
-            for char in row:
-                if char.isdigit():
-                    file += int(char)
-                elif char.isalpha():
-                    is_white = char.isupper()
-                    piece = char.lower()
-                    pos = (file, rank)
-                    file += 1
-                    positions = white_positions if is_white else black_positions
-                    positions.setdefault(piece, []).append(pos)
-        return white_positions, black_positions, turn
-
-    @staticmethod
-    def encode_fen_to_features(fen):
-        '''
-        position: fen string
-        returns: tuple of black embedding and white embedding
-        '''
-        white_positions, black_positions, turn = Features.parse_fen(fen)
-        
-        def flip_positions(color_positions):
-            # flip positions for "them" perspective
-            for piece, positions in color_positions.items():
-                color_positions[piece] = [(7 - file, 7 - rank) for file, rank in positions]
-            return color_positions
-
-        if turn == "w":
-            us = white_positions
-            them = black_positions
-        else:
-            us = flip_positions(black_positions)
-            them = flip_positions(white_positions)
-
-        us_features, them_features = torch.zeros(NUM_FEATURES), torch.zeros(NUM_FEATURES)
-        us_king_pos, them_king_pos = us["k"][0], them["k"][0]
-
-        for piece, positions in us.items():
-            if piece == "k": continue
-            for pos in positions:
-                # print(pos)
-                # print(piece)
-                # print(them_king_pos)
-                us_idx = Features.feature_idx(piece, True, pos, us_king_pos)
-                them_idx = Features.feature_idx(piece, False, pos, them_king_pos)
-                us_features[us_idx] = 1.0
-                them_features[them_idx] = 1.0
-
-        for piece, positions in them.items():
-            if piece == "k": continue
-            for pos in positions:
-                us_idx = Features.feature_idx(piece, False, pos, us_king_pos)
-                them_idx = Features.feature_idx(piece, True, pos, them_king_pos)
-                us_features[us_idx] = 1.0
-                them_features[them_idx] = 1.0
-
-        return torch.stack([us_features, them_features])
-
-print(Features.parse_fen("8/8/2B3N1/5p2/6p1/6pk/4K2b/7r w - -"))
-Features.encode_fen_to_features("8/8/2B3N1/5p2/6p1/6pk/4K2b/7r w - -")
-
-# TODO: full dataloader
 # TODO: validation
 # TODO: investigate regularization
 
-from apache_beam import coders
-decode = coders.TupleCoder((coders.StrUtf8Coder(), coders.FloatCoder())).decode
-
+NUM_EPOCHS = 1
 BATCH_SIZE = 128
 MICRO_BATCH_SIZE = 4
 
 if __name__ == "__main__":
-    from itertools import batched
-    from bagz import BagFileReader
+    train_dataset = ChessBench("data/train/action_value-@2148_data.bag", sharded=True)
+    valid_dataset = ChessBench("data/valid/action_value_valid_data.bag")
+
+    train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=chessbench_collate)
+    valid_dataloader = DataLoader(valid_dataset, batch_size=32, shuffle=False, collate_fn=chessbench_collate)
 
     torch.set_float32_matmul_precision('medium')
 
     model = NanoNNUE().to(device)
     optimizer = optim.Adam(model.parameters())
 
-    for batch in batched(BagFileReader("data/train/action_value-00000-of-02148_data.bag"), BATCH_SIZE):
-        batch_boards, batch_probs = torch.tensor([], device="cpu"), torch.tensor([], device="cpu")
 
-        for fen, prob in map(decode, batch):
-            print(fen)
-            turn = fen.split(" ")[1]
-            board = Features.encode_fen_to_features(fen).to("cpu")
-            prob = torch.tensor(prob).to("cpu")
-            batch_boards = torch.cat((batch_boards, torch.unsqueeze(board, 0)))
-            batch_probs = torch.cat((batch_probs, torch.unsqueeze(prob, 0)))
+    @torch.compile()
+    def train_step(boards_batch, probs_batch):
         model.train()
+        grad_accum_steps = BATCH_SIZE // MICRO_BATCH_SIZE
+        total_loss = 0.0
+        optimizer.zero_grad()
+        for i in range(grad_accum_steps):
+            start = i * MICRO_BATCH_SIZE
+            end = (i + 1) * MICRO_BATCH_SIZE
+            micro_batch_boards = boards_batch[start:end].to(device)
+            micro_batch_probs = probs_batch[start:end].to(device)
+            loss = model.loss(micro_batch_boards, micro_batch_probs)
+            lossf = loss.item()
+            total_loss += lossf / grad_accum_steps
+            loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        return total_loss
 
-        while 1: # overfit the first batch
-            # @torch.compile
-            def train_step():
-                grad_accum_steps = BATCH_SIZE // MICRO_BATCH_SIZE
-                total_loss = 0
-                for i in range(grad_accum_steps):
-                    micro_batch_boards = batch_boards[i*MICRO_BATCH_SIZE:(i+1)*MICRO_BATCH_SIZE,:,:].to(device)
-                    micro_batch_probs = batch_probs[i*MICRO_BATCH_SIZE:(i+1)*MICRO_BATCH_SIZE].to(device)
-                    loss = model.loss(micro_batch_boards, micro_batch_probs)
-                    lossf = loss.item()
-                    total_loss += lossf / grad_accum_steps
-                    loss.backward()
-                    
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
-                print(f"Training loss: {total_loss}")
-            train_step()
+    @torch.compile()
+    def valid_loss():
+        model.eval()
+        total_val_loss = 0.0
+        count = 0
+        with torch.no_grad():
+            for boards_batch, probs_batch in valid_dataloader:
+                boards_batch = boards_batch.to(device)
+                probs_batch = probs_batch.to(device)
+                loss = model.loss(boards_batch, probs_batch)
+                total_val_loss += loss.item()
+                count += 1
+        avg_val_loss = total_val_loss / count if count else 0
+        return avg_val_loss
+    
+
+    step = 0
+
+    for epoch in range(NUM_EPOCHS):
+        print(f"starting epoch: {epoch}")
+        for boards_batch, probs_batch in train_dataset:
+
+            loss = train_step(boards_batch, probs_batch)
+            print(f"step {step}: training loss: {loss:.4f}")
+
+            step += 1
