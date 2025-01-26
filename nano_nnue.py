@@ -27,6 +27,7 @@ class Embedding(nn.Module):
 
         self.indices_logits = nn.Parameter(torch.rand(NUM_FEATURES, NUM_VECTORS))
 
+
     # TODO: inference should only use partial evaluation since usually only a couple features change
     def forward(self, active_features):
         '''
@@ -37,10 +38,12 @@ class Embedding(nn.Module):
 
         indices_logits = self.indices_logits.to(active_features.device)
         indices_logits = self.indices_logits.reshape(1, NUM_FEATURES, NUM_VECTORS).expand(batch_size, -1, -1)
-        indices_sample = F.gumbel_softmax(indices_logits, tau=1.0, hard=True)
+
+        # indices_sample = F.gumbel_softmax(indices_logits, tau=1.0, hard=True)
         # indices_sample = F.gumbel_softmax(indices_logits, tau=0.001, hard=True)
-        # indices_sample = F.gumbel_softmax(indices_logits, tau=1.0, hard=False)
+        indices_sample = F.gumbel_softmax(indices_logits, tau=1.0, hard=False)
         # indices_sample = F.gumbel_softmax(indices_logits, tau=0.001, hard=False)
+        # indices_sample = F.gumbel_softmax(indices_logits, tau=0.5, hard=False)
 
         num_piece_features = NUM_FEATURES // NUM_PIECES
         position_embedding = torch.zeros(batch_size, self.vector_dim, device=active_features.device)
@@ -54,6 +57,11 @@ class Embedding(nn.Module):
             position_embedding += piece_vectors
 
         return position_embedding
+
+    def entropy_penalty(self):
+        p = F.softmax(self.indices_logits, dim=-1)
+        entropy = - (p * (p + 1e-9).log()).sum(dim=-1).mean()
+        return entropy
 
     def regularization_king_square(self):
         reshaped_logits = self.indices_logits.reshape(NUM_PIECES, NUM_SQUARES, NUM_SQUARES, NUM_VECTORS)
@@ -96,6 +104,20 @@ class NanoNNUE(nn.Module):
             nn.LeakyReLU(),
             nn.Linear(32, 1) # TODO: maybe have 8, one for each game stage
         )
+    
+    def init_weights(self, init_mode):
+        if init_mode == "uniform":
+            nn.init.constant_(self.half_kp.indices_logits, 0.0)
+        elif init_mode == "peaked":
+            with torch.no_grad():
+                for f in range(NUM_FEATURES):
+                    winner = torch.randint(0, NUM_VECTORS, (1,))
+                    self.half_kp.indices_logits[f].fill_(-5.0)  # negative
+                    self.half_kp.indices_logits[f, winner] = 5.0
+        elif init_mode == "normal":
+            nn.init.normal_(self.half_kp.indices_logits, mean=0.0, std=1.0)
+        else:
+            raise ValueError(f"Unknown init_mode: {init_mode}")
 
     def forward(self, features):
         us_embedding = self.half_kp.forward(features[:,0,:])
@@ -106,17 +128,23 @@ class NanoNNUE(nn.Module):
     def loss(self, x, y_exp, loss_fn=nn.MSELoss()):
         y = self.forward(x)
         regression_loss = loss_fn(y, y_exp)
-        return regression_loss #+ self.half_kp.regularization_loss(0, 0, 1) # TODO: check other regularization as well
+        entropy_penalty = self.half_kp.entropy_penalty()
+        total_loss = regression_loss + entropy_penalty
+        penalties = {"entropy": entropy_penalty}
+        return total_loss, penalties
 
 # TODO: investigate regularization
 # TODO: validation with argmax probabilities
 
 NUM_EPOCHS = 5
 BATCH_SIZE = 128
-MICRO_BATCH_SIZE = 4
+MICRO_BATCH_SIZE = 8
 VALID_EVERY = 1000
 VALID_BATCH_SIZE = 8
 NUM_VALID_SAMPLES = 131072
+
+VALID_EVERY = 100
+NUM_VALID_SAMPLES = 32768
 
 if __name__ == "__main__":
     curr_dir = os.path.dirname(os.path.abspath(__file__))
@@ -134,7 +162,9 @@ if __name__ == "__main__":
     torch.set_float32_matmul_precision('medium')
 
     model = NanoNNUE().to(device)
-    optimizer = optim.Adam(model.parameters())
+    model.init_weights(init_mode="peaked")
+    # model.init_weights(init_mode="uniform")
+    optimizer = optim.Adam(model.parameters(), lr=0.01)
 
     @torch.compile()
     def train_step(boards_batch, probs_batch):
@@ -147,13 +177,13 @@ if __name__ == "__main__":
             end = (i + 1) * MICRO_BATCH_SIZE
             micro_batch_boards = boards_batch[start:end].to(device)
             micro_batch_probs = probs_batch[start:end].to(device)
-            loss = model.loss(micro_batch_boards, micro_batch_probs)
+            loss, penalties = model.loss(micro_batch_boards, micro_batch_probs)
             lossf = loss.item()
             total_loss += lossf / grad_accum_steps
             loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
-        return total_loss
+        return total_loss, penalties # works for now, because penalties only change with model update
 
     @torch.compile()
     def valid_loss():
@@ -164,7 +194,7 @@ if __name__ == "__main__":
             for boards_batch, probs_batch in tqdm(valid_dataloader):
                 boards_batch = boards_batch.to(device)
                 probs_batch = probs_batch.to(device)
-                loss = model.loss(boards_batch, probs_batch)
+                loss, _ = model.loss(boards_batch, probs_batch)
                 total_val_loss += loss.item()
                 count += 1
         avg_val_loss = total_val_loss / count if count else 0
@@ -177,9 +207,9 @@ if __name__ == "__main__":
         for boards_batch, probs_batch in train_dataloader:
 
             st = time.monotonic()
-            loss = train_step(boards_batch, probs_batch)
+            loss, penalties = train_step(boards_batch, probs_batch)
             elapsed = time.monotonic() - st
-            print(f"step {step}: training loss: {loss} ({elapsed:.4f}s)")
+            print(f"step {step}: training loss: {loss:.7f}, entropy penalty: {penalties['entropy']:.7f} ({elapsed:.4f}s)")
 
             if step % VALID_EVERY == 0:
                 vloss = valid_loss()
