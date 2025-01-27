@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
 
-import os, time
+import os, time, math
 from tqdm import tqdm
 
 from constants import *
@@ -58,40 +58,16 @@ class Embedding(nn.Module):
 
         return position_embedding
 
-    def entropy_penalty(self):
+    def index_entropy(self):
         p = F.softmax(self.indices_logits, dim=-1)
         entropy = - (p * (p + 1e-9).log()).sum(dim=-1).mean()
         return entropy
 
-    def regularization_king_square(self):
-        reshaped_logits = self.indices_logits.reshape(NUM_PIECES, NUM_SQUARES, NUM_SQUARES, NUM_VECTORS)
-        return torch.var(reshaped_logits, dim=2).mean()
-
-    def regularization_neighboring_squares(self):
-        # This was completely taken from ChatGPT
-
-        # Reshape logits to group square dimensions
-        reshaped_logits = self.indices_logits.reshape(NUM_PIECES, NUM_SQUARES, NUM_SQUARES, NUM_VECTORS)
-
-        # Define a 2D Laplacian kernel for computing differences
-        kernel = torch.tensor([[0, -1, 0], [-1, 4, -1], [0, -1, 0]], dtype=torch.float32)
-        kernel = kernel.unsqueeze(0).unsqueeze(0)  # Shape (1, 1, 3, 3)
-
-        # Apply convolution to capture differences
-        conv = nn.Conv2d(1, 1, kernel_size=3, padding=1, bias=False)
-        conv.weight.data = kernel
-        conv.weight.requires_grad = False
-
-        # Apply convolution to the logits
-        logits_square_diff = conv(reshaped_logits[:, :, :, :1])  # Apply to the first channel only
-        smoothness_loss = torch.mean(logits_square_diff ** 2)
-        return smoothness_loss
-
-    def regularization_index_penalty(self):
-        return torch.mean(self.indices_logits ** 2)
-
-    def regularization_loss(self, l1, l2, l3):
-        return l1 * self.regularization_king_square() + l2 * self.regularization_neighboring_squares() + l3 * self.regularization_index_penalty()
+    def expected_index_penalty(self):
+        p = F.softmax(self.indices_logits, dim=-1)
+        idxs = torch.arange(NUM_VECTORS, device=p.device, dtype=p.dtype)
+        expected_index = (p * idxs).sum(dim=-1)
+        return (expected_index ** 2).mean()
 
 class NanoNNUE(nn.Module):
     def __init__(self):
@@ -128,9 +104,10 @@ class NanoNNUE(nn.Module):
     def loss(self, x, y_exp, loss_fn=nn.MSELoss()):
         y = self.forward(x)
         regression_loss = loss_fn(y, y_exp)
-        entropy_penalty = self.half_kp.entropy_penalty()
-        total_loss = regression_loss + entropy_penalty
-        penalties = {"entropy": entropy_penalty}
+        entropy_penalty = self.half_kp.index_entropy()
+        index_penalty = self.half_kp.expected_index_penalty() / 4096.0
+        total_loss = regression_loss + entropy_penalty + index_penalty
+        penalties = {"entropy": entropy_penalty, "index": index_penalty}
         return total_loss, penalties
 
 # TODO: investigate regularization
@@ -143,7 +120,6 @@ VALID_EVERY = 1000
 VALID_BATCH_SIZE = 8
 NUM_VALID_SAMPLES = 131072
 
-VALID_EVERY = 100
 NUM_VALID_SAMPLES = 32768
 
 if __name__ == "__main__":
@@ -154,7 +130,7 @@ if __name__ == "__main__":
     small_valid_dataset = Subset(valid_dataset, range(NUM_VALID_SAMPLES))
 
     train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=chessbench_collate)
-    valid_dataloader = DataLoader(small_valid_dataset, batch_size=VALID_BATCH_SIZE, shuffle=False, collate_fn=chessbench_collate)
+    valid_dataloader = DataLoader(small_valid_dataset, batch_size=VALID_BATCH_SIZE, shuffle=True, collate_fn=chessbench_collate)
 
     checkpoint_dir = os.path.join(curr_dir, "checkpoints")
     if not os.path.exists(checkpoint_dir): os.makedirs(checkpoint_dir)
@@ -191,7 +167,7 @@ if __name__ == "__main__":
         total_val_loss = 0.0
         count = 0
         with torch.no_grad():
-            for boards_batch, probs_batch in tqdm(valid_dataloader):
+            for boards_batch, probs_batch in valid_dataloader:
                 boards_batch = boards_batch.to(device)
                 probs_batch = probs_batch.to(device)
                 loss, _ = model.loss(boards_batch, probs_batch)
@@ -209,9 +185,9 @@ if __name__ == "__main__":
             st = time.monotonic()
             loss, penalties = train_step(boards_batch, probs_batch)
             elapsed = time.monotonic() - st
-            print(f"step {step}: training loss: {loss:.7f}, entropy penalty: {penalties['entropy']:.7f} ({elapsed:.4f}s)")
+            print(f"step {step}: training loss: {loss:.7f}, entropy penalty: {penalties['entropy']:.7f}, expected index: {math.sqrt(penalties['index'] * 4096):.7f} ({elapsed:.4f}s)")
 
-            if step % VALID_EVERY == 0:
+            if step % VALID_EVERY == -1:
                 vloss = valid_loss()
                 print(f"==> validation loss at step {step}: {vloss}")
                 checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint-{epoch}-{step}.pt")
