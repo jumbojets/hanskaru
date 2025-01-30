@@ -120,7 +120,9 @@ VALID_EVERY = 1000
 VALID_BATCH_SIZE = 8
 NUM_VALID_SAMPLES = 131072
 
-NUM_VALID_SAMPLES = 32768
+NUM_VALID_SAMPLES = 65536
+
+LOAD = "checkpoints/checkpoint-0-4000-good.pt" # None if from scratch
 
 if __name__ == "__main__":
     curr_dir = os.path.dirname(os.path.abspath(__file__))
@@ -138,9 +140,15 @@ if __name__ == "__main__":
     torch.set_float32_matmul_precision('medium')
 
     model = NanoNNUE().to(device)
-    model.init_weights(init_mode="peaked")
-    # model.init_weights(init_mode="uniform")
-    optimizer = optim.Adam(model.parameters(), lr=0.01)
+
+    if LOAD is not None:
+        weights = torch.load(LOAD, weights_only=True)["model_state_dict"]
+        model.load_state_dict(weights)
+    else:
+        model.init_weights(init_mode="peaked")
+        # model.init_weights(init_mode="uniform")
+
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
 
     @torch.compile()
     def train_step(boards_batch, probs_batch):
@@ -187,7 +195,7 @@ if __name__ == "__main__":
             elapsed = time.monotonic() - st
             print(f"step {step}: training loss: {loss:.7f}, entropy penalty: {penalties['entropy']:.7f}, expected index: {math.sqrt(penalties['index'] * 4096):.7f} ({elapsed:.4f}s)")
 
-            if step % VALID_EVERY == -1:
+            if step % VALID_EVERY == 0:
                 vloss = valid_loss()
                 print(f"==> validation loss at step {step}: {vloss}")
                 checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint-{epoch}-{step}.pt")
