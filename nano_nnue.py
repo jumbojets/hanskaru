@@ -107,7 +107,7 @@ class NanoNNUE(nn.Module):
         entropy_penalty = self.half_kp.index_entropy()
         index_penalty = self.half_kp.expected_index_penalty() / 4096.0
         total_loss = regression_loss + entropy_penalty + index_penalty
-        penalties = {"entropy": entropy_penalty, "index": index_penalty}
+        penalties = {"regression": regression_loss, "entropy": entropy_penalty, "index": index_penalty}
         return total_loss, penalties
 
 # TODO: investigate regularization
