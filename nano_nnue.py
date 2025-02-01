@@ -110,29 +110,22 @@ class NanoNNUE(nn.Module):
         penalties = {"regression": regression_loss, "entropy": entropy_penalty, "index": index_penalty}
         return total_loss, penalties
 
-# TODO: investigate regularization
-# TODO: validation with argmax probabilities
-
 NUM_EPOCHS = 5
 BATCH_SIZE = 128
 MICRO_BATCH_SIZE = 8
 VALID_EVERY = 1000
 VALID_BATCH_SIZE = 8
-NUM_VALID_SAMPLES = 131072
 
-NUM_VALID_SAMPLES = 65536
-
-LOAD = "checkpoints/checkpoint-0-4000-good.pt" # None if from scratch
+LOAD = "checkpoints/checkpoint-0-3000.pt" # None if from scratch
 
 if __name__ == "__main__":
     curr_dir = os.path.dirname(os.path.abspath(__file__))
 
-    train_dataset = ChessBench(os.path.join(curr_dir, "data/train/action_value@0004_data.bag"), sharded=True)
-    valid_dataset = ChessBench(os.path.join(curr_dir, "data/test/action_value_data.bag"))
-    small_valid_dataset = Subset(valid_dataset, range(NUM_VALID_SAMPLES))
+    train_dataset = ChessBench(os.path.join(curr_dir, "data/train/state_value_data.bag"))
+    valid_dataset = ChessBench(os.path.join(curr_dir, "data/test/state_value_data.bag"))
 
     train_dataloader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=chessbench_collate)
-    valid_dataloader = DataLoader(small_valid_dataset, batch_size=VALID_BATCH_SIZE, shuffle=True, collate_fn=chessbench_collate)
+    valid_dataloader = DataLoader(valid_dataset, batch_size=VALID_BATCH_SIZE, shuffle=True, collate_fn=chessbench_collate)
 
     checkpoint_dir = os.path.join(curr_dir, "checkpoints")
     if not os.path.exists(checkpoint_dir): os.makedirs(checkpoint_dir)
@@ -175,7 +168,7 @@ if __name__ == "__main__":
         total_val_loss = 0.0
         count = 0
         with torch.no_grad():
-            for boards_batch, probs_batch in valid_dataloader:
+            for boards_batch, probs_batch in tqdm(valid_dataloader):
                 boards_batch = boards_batch.to(device)
                 probs_batch = probs_batch.to(device)
                 loss, _ = model.loss(boards_batch, probs_batch)
@@ -193,7 +186,7 @@ if __name__ == "__main__":
             st = time.monotonic()
             loss, penalties = train_step(boards_batch, probs_batch)
             elapsed = time.monotonic() - st
-            print(f"step {step}: training loss: {loss:.7f}, entropy penalty: {penalties['entropy']:.7f}, expected index: {math.sqrt(penalties['index'] * 4096):.7f} ({elapsed:.4f}s)")
+            print(f"step {step}: training loss: {penalties['regression']:.7f}, entropy penalty: {penalties['entropy']:.7f}, expected index: {math.sqrt(penalties['index'] * 4096):.7f} ({elapsed:.4f}s)")
 
             if step % VALID_EVERY == 0:
                 vloss = valid_loss()
