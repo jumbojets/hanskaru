@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
+from torch.optim.lr_scheduler import LambdaLR, CosineAnnealingLR, SequentialLR
 
 import os, time, math
 from tqdm import tqdm
@@ -41,9 +42,9 @@ class Embedding(nn.Module):
 
         # indices_sample = F.gumbel_softmax(indices_logits, tau=1.0, hard=True)
         # indices_sample = F.gumbel_softmax(indices_logits, tau=0.001, hard=True)
-        indices_sample = F.gumbel_softmax(indices_logits, tau=1.0, hard=False)
+        # indices_sample = F.gumbel_softmax(indices_logits, tau=1.0, hard=False)
         # indices_sample = F.gumbel_softmax(indices_logits, tau=0.001, hard=False)
-        # indices_sample = F.gumbel_softmax(indices_logits, tau=0.5, hard=False)
+        indices_sample = F.gumbel_softmax(indices_logits, tau=0.1, hard=False)
 
         num_piece_features = NUM_FEATURES // NUM_PIECES
         position_embedding = torch.zeros(batch_size, self.vector_dim, device=active_features.device)
@@ -63,14 +64,14 @@ class Embedding(nn.Module):
         entropy = - (p * (p + 1e-9).log()).sum(dim=-1).mean()
         return entropy
 
-    def expected_index_penalty(self):
+    def expected_index(self):
         p = F.softmax(self.indices_logits, dim=-1)
         idxs = torch.arange(NUM_VECTORS, device=p.device, dtype=p.dtype)
         expected_index = (p * idxs).sum(dim=-1)
-        return (expected_index ** 2).mean()
+        return expected_index.mean(), (expected_index ** 2).mean()
 
 class NanoNNUE(nn.Module):
-    def __init__(self):
+    def __init__(self, initial_step=0):
         super(NanoNNUE, self).__init__()
         self.half_kp = Embedding()
         self.seq = nn.Sequential(
@@ -80,20 +81,22 @@ class NanoNNUE(nn.Module):
             nn.LeakyReLU(),
             nn.Linear(32, 1) # TODO: maybe have 8, one for each game stage
         )
+        self.schedule_train_params(initial_step)
     
     def init_weights(self, init_mode):
-        if init_mode == "uniform":
-            nn.init.constant_(self.half_kp.indices_logits, 0.0)
-        elif init_mode == "peaked":
-            with torch.no_grad():
+        with torch.no_grad():
+            if init_mode == "lower_bias":
+                slope_vector = -0.01 * torch.arange(NUM_VECTORS, device=self.half_kp.indices_logits.device, dtype=self.half_kp.indices_logits.dtype)
+                self.half_kp.indices_logits.copy_(slope_vector.unsqueeze(0).expand(NUM_FEATURES, -1))
+            elif init_mode == "uniform":
+                nn.init.constant_(self.half_kp.indices_logits, 0.0)
+            elif init_mode == "peaked":
                 for f in range(NUM_FEATURES):
                     winner = torch.randint(0, NUM_VECTORS, (1,))
                     self.half_kp.indices_logits[f].fill_(-5.0)  # negative
                     self.half_kp.indices_logits[f, winner] = 5.0
-        elif init_mode == "normal":
-            nn.init.normal_(self.half_kp.indices_logits, mean=0.0, std=1.0)
-        else:
-            raise ValueError(f"Unknown init_mode: {init_mode}")
+            else:
+                raise ValueError(f"Unknown init_mode: {init_mode}")
 
     def forward(self, features):
         us_embedding = self.half_kp.forward(features[:,0,:])
@@ -104,19 +107,27 @@ class NanoNNUE(nn.Module):
     def loss(self, x, y_exp, loss_fn=nn.MSELoss()):
         y = self.forward(x)
         regression_loss = loss_fn(y, y_exp)
-        entropy_penalty = self.half_kp.index_entropy()
-        index_penalty = self.half_kp.expected_index_penalty() / 4096.0
-        total_loss = regression_loss + entropy_penalty + index_penalty
-        penalties = {"regression": regression_loss, "entropy": entropy_penalty, "index": index_penalty}
+        entropy = self.half_kp.index_entropy()
+        expected_index, index_penalty = self.half_kp.expected_index()
+        total_loss = regression_loss + entropy * self.train_params["entropy_lambda"] + index_penalty * self.train_params["index_lambda"]
+        penalties = {"regression": regression_loss, "entropy": entropy, "expected_index": expected_index}
         return total_loss, penalties
 
+    def schedule_train_params(self, step):
+        if step < 1000: # WARMUP
+            # no lambda penalties
+            self.train_params = {"entropy_lambda": 0, "index_lambda": 0}
+        else:
+            self.train_params = {"entropy_lambda": 1/50, "index_lambda": 1/16384}
+        return self.train_params
+
 NUM_EPOCHS = 5
-BATCH_SIZE = 128
+BATCH_SIZE = 256
 MICRO_BATCH_SIZE = 8
 VALID_EVERY = 1000
 VALID_BATCH_SIZE = 8
 
-LOAD = "checkpoints/checkpoint-0-3000.pt" # None if from scratch
+LOAD = None
 
 if __name__ == "__main__":
     curr_dir = os.path.dirname(os.path.abspath(__file__))
@@ -138,10 +149,18 @@ if __name__ == "__main__":
         weights = torch.load(LOAD, weights_only=True)["model_state_dict"]
         model.load_state_dict(weights)
     else:
-        model.init_weights(init_mode="peaked")
-        # model.init_weights(init_mode="uniform")
+        model.init_weights(init_mode="lower_bias")
 
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    optimizer = optim.Adam(model.parameters())
+
+    total_steps = 25000
+    warmup_steps = 1000
+    base_lr = 1e-3
+    min_lr = 1e-5
+    def warmup_lambda(current_step: int): return float(current_step) / float(warmup_steps)
+    scheduler_warmup = LambdaLR(optimizer, lr_lambda=warmup_lambda)
+    scheduler_cosine = CosineAnnealingLR(optimizer, T_max=(total_steps - warmup_steps), eta_min=min_lr)
+    scheduler = SequentialLR(optimizer, schedulers=[scheduler_warmup, scheduler_cosine], milestones=[warmup_steps])
 
     @torch.compile()
     def train_step(boards_batch, probs_batch):
@@ -160,6 +179,7 @@ if __name__ == "__main__":
             loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
+        scheduler.step()
         return total_loss, penalties # works for now, because penalties only change with model update
 
     @torch.compile()
@@ -183,12 +203,15 @@ if __name__ == "__main__":
         print(f"starting epoch: {epoch}")
         for boards_batch, probs_batch in train_dataloader:
 
+            model.schedule_train_params(step)
+
             st = time.monotonic()
             loss, penalties = train_step(boards_batch, probs_batch)
             elapsed = time.monotonic() - st
-            print(f"step {step}: training loss: {penalties['regression']:.7f}, entropy penalty: {penalties['entropy']:.7f}, expected index: {math.sqrt(penalties['index'] * 4096):.7f} ({elapsed:.4f}s)")
+            current_lr = optimizer.param_groups[0]["lr"]
+            print(f"step {step}: regression loss: {penalties['regression']:.7f}, entropy penalty: {penalties['entropy']:.7f}, expected index: {penalties['expected_index']:.7f} (lr {current_lr:.7f}) ({elapsed:.4f}s)")
 
-            if step % VALID_EVERY == 0:
+            if step % VALID_EVERY == 0 and step != 0:
                 vloss = valid_loss()
                 print(f"==> validation loss at step {step}: {vloss}")
                 checkpoint_path = os.path.join(checkpoint_dir, f"checkpoint-{epoch}-{step}.pt")
@@ -197,6 +220,7 @@ if __name__ == "__main__":
                     "step": step,
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
                     "loss": vloss
                 }, checkpoint_path)
 
