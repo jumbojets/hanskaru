@@ -30,7 +30,7 @@ class Embedding(nn.Module):
 
 
     # TODO: inference should only use partial evaluation since usually only a couple features change
-    def forward(self, active_features):
+    def forward(self, active_features, tau=1.0):
         '''
         Forward pass
         active_features: (batch_size, num_features)
@@ -44,7 +44,8 @@ class Embedding(nn.Module):
         # indices_sample = F.gumbel_softmax(indices_logits, tau=0.001, hard=True)
         # indices_sample = F.gumbel_softmax(indices_logits, tau=1.0, hard=False)
         # indices_sample = F.gumbel_softmax(indices_logits, tau=0.001, hard=False)
-        indices_sample = F.gumbel_softmax(indices_logits, tau=0.1, hard=False)
+        # indices_sample = F.gumbel_softmax(indices_logits, tau=0.1, hard=False)
+        indices_sample = F.gumbel_softmax(indices_logits, tau, hard=False)
 
         num_piece_features = NUM_FEATURES // NUM_PIECES
         position_embedding = torch.zeros(batch_size, self.vector_dim, device=active_features.device)
@@ -71,7 +72,7 @@ class Embedding(nn.Module):
         return expected_index.mean(), (expected_index ** 2).mean()
 
 class NanoNNUE(nn.Module):
-    def __init__(self, initial_step=0):
+    def __init__(self, initial_step=0, max_steps=30000):
         super(NanoNNUE, self).__init__()
         self.half_kp = Embedding()
         self.seq = nn.Sequential(
@@ -81,6 +82,7 @@ class NanoNNUE(nn.Module):
             nn.LeakyReLU(),
             nn.Linear(32, 1) # TODO: maybe have 8, one for each game stage
         )
+        self.train_params = {"max_steps": max_steps}
         self.schedule_train_params(initial_step)
     
     def init_weights(self, init_mode):
@@ -99,8 +101,8 @@ class NanoNNUE(nn.Module):
                 raise ValueError(f"Unknown init_mode: {init_mode}")
 
     def forward(self, features):
-        us_embedding = self.half_kp.forward(features[:,0,:])
-        them_embedding = self.half_kp.forward(features[:,1,:])
+        us_embedding = self.half_kp.forward(features[:,0,:], self.train_params["tau"])
+        them_embedding = self.half_kp.forward(features[:,1,:], self.train_params["tau"])
         total_embedding = torch.cat((us_embedding, them_embedding), dim=1)
         return self.seq.forward(total_embedding)
 
@@ -114,11 +116,14 @@ class NanoNNUE(nn.Module):
         return total_loss, penalties
 
     def schedule_train_params(self, step):
-        if step < 1000: # WARMUP
-            # no lambda penalties
-            self.train_params = {"entropy_lambda": 0, "index_lambda": 0}
+        ratio = min(step / float(self.train_params["max_steps"]), 1.0)
+        tau_start, tau_end = 5, 0.1
+        tau_decay = tau_start + ratio * (tau_end - tau_start)
+        self.train_params["tau"] = tau_decay
+        if step < 3000: # WARMUP
+            self.train_params.update({"entropy_lambda": 0, "index_lambda": 0})
         else:
-            self.train_params = {"entropy_lambda": 1/50, "index_lambda": 1/16384}
+            self.train_params.update({"entropy_lambda": 1/50, "index_lambda": 1/16384})
         return self.train_params
 
 NUM_EPOCHS = 5
@@ -153,10 +158,10 @@ if __name__ == "__main__":
 
     optimizer = optim.Adam(model.parameters())
 
-    total_steps = 25000
-    warmup_steps = 1000
+    total_steps = 30000
+    warmup_steps = 3000
     base_lr = 1e-3
-    min_lr = 1e-5
+    min_lr = 1e-4
     def warmup_lambda(current_step: int): return float(current_step) / float(warmup_steps)
     scheduler_warmup = LambdaLR(optimizer, lr_lambda=warmup_lambda)
     scheduler_cosine = CosineAnnealingLR(optimizer, T_max=(total_steps - warmup_steps), eta_min=min_lr)
@@ -177,7 +182,7 @@ if __name__ == "__main__":
             lossf = loss.item()
             total_loss += lossf / grad_accum_steps
             loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
         optimizer.step()
         scheduler.step()
         return total_loss, penalties # works for now, because penalties only change with model update
