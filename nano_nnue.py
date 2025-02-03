@@ -117,13 +117,13 @@ class NanoNNUE(nn.Module):
 
     def schedule_train_params(self, step):
         ratio = min(step / float(self.train_params["max_steps"]), 1.0)
-        tau_start, tau_end = 5, 0.1
+        tau_start, tau_end = 1, 0.1
         tau_decay = tau_start + ratio * (tau_end - tau_start)
         self.train_params["tau"] = tau_decay
         if step < 3000: # WARMUP
             self.train_params.update({"entropy_lambda": 0, "index_lambda": 0})
         else:
-            self.train_params.update({"entropy_lambda": 1/50, "index_lambda": 1/16384})
+            self.train_params.update({"entropy_lambda": 1/8, "index_lambda": 1/(2**15)})
         return self.train_params
 
 NUM_EPOCHS = 5
